@@ -28,15 +28,18 @@
 /*
  * 2^64 divided by the golden ratio, rounded to odd (the splitmix64
  * increment). Multiplying by it scatters consecutive or structured
- * ids across the high bits, which the mask then folds onto the slot
- * range (Fibonacci hashing).
+ * ids across the high bits, and the top bits of the product pick the
+ * slot (Fibonacci hashing). The low bits would not do: bit i of the
+ * product depends only on bits 0..i of the id, and a posting-encoded
+ * TID keeps its tuple offset in the low 16.
  */
 #define VS_HASH_GOLDEN_GAMMA 0x9E3779B97F4A7C15ULL
 
 typedef struct VsIdSet
 {
 	uint64_t *slots;
-	uint32_t  mask; /* nslots - 1; nslots is a power of two */
+	uint32_t  mask;	 /* nslots - 1; nslots is a power of two */
+	uint32_t  shift; /* 64 - log2(nslots) */
 	bool	  has_zero;
 } VsIdSet;
 
@@ -53,14 +56,19 @@ vs_idset_init(VsIdSet *set, uint32_t expected)
 {
 	uint64_t want	= (uint64_t)expected * 2;
 	uint32_t nslots = 2;
+	uint32_t bits	= 1;
 
 	if (expected > (1u << 30))
 		vs_error("id set population %u exceeds the slot ceiling", expected);
 
 	while ((uint64_t)nslots < want)
+	{
 		nslots <<= 1;
+		bits++;
+	}
 	set->slots	  = vs_alloc0(nslots * sizeof(uint64_t));
 	set->mask	  = nslots - 1;
+	set->shift	  = 64 - bits;
 	set->has_zero = false;
 }
 
@@ -79,7 +87,7 @@ vs_idset_test_add(VsIdSet *set, uint64_t id)
 		return true;
 	}
 
-	uint32_t slot = (uint32_t)(id * VS_HASH_GOLDEN_GAMMA) & set->mask;
+	uint32_t slot = (uint32_t)((id * VS_HASH_GOLDEN_GAMMA) >> set->shift);
 	while (set->slots[slot] != 0 && set->slots[slot] != id)
 		slot = (slot + 1) & set->mask;
 	if (set->slots[slot] == id)

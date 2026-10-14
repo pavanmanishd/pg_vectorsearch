@@ -9,6 +9,7 @@
  * - Id 0 handling via the dedicated flag
  * - Collision chains at the sizing bound (load factor <= 1/2)
  * - Structured id patterns (posting-encoded TIDs)
+ * - Short probe chains for TIDs that share a tuple offset
  */
 
 #include "core/idset.h"
@@ -67,6 +68,35 @@ TEST(idset_full_population)
 			dups++;
 	}
 	ASSERT_EQ(n, dups, "every re-add reports membership");
+
+	vs_idset_cleanup(&set);
+}
+
+TEST(idset_shared_offset_spreads)
+{
+	/* TIDs that share a tuple offset differ only above bit 16. Their
+	 * slots must still spread, or every insert probes past all the ids
+	 * before it. The longest run of occupied slots bounds any probe. */
+	const uint32_t n = 4096;
+
+	VsIdSet set;
+	vs_idset_init(&set, n);
+
+	for (uint32_t b = 1; b <= n; b++)
+		(void)vs_idset_test_add(&set, ((uint64_t)b << 16) | 1);
+
+	/* Two passes over the slots, so a run that wraps is measured whole. */
+	uint32_t nslots	 = set.mask + 1;
+	uint32_t longest = 0;
+	uint32_t run	 = 0;
+	for (uint32_t i = 0; i < 2 * nslots; i++)
+	{
+		if (set.slots[i & set.mask] == 0)
+			run = 0;
+		else if (++run > longest)
+			longest = run;
+	}
+	ASSERT_TRUE(longest <= 32, "ids sharing an offset land in short runs");
 
 	vs_idset_cleanup(&set);
 }
