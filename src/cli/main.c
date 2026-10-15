@@ -22,6 +22,7 @@
 
 /* Forward declarations of command handlers */
 int cmd_bench_distance(CmdContext *ctx);
+int cmd_bench_idset(CmdContext *ctx);
 int cmd_bench_quantize(CmdContext *ctx);
 int cmd_bench_cluster(CmdContext *ctx);
 int cmd_bench_search(CmdContext *ctx);
@@ -48,6 +49,7 @@ typedef struct
  */
 static const Command bench_commands[] = {
 		{"distance", cmd_bench_distance, "Benchmark distance computations"},
+		{"idset", cmd_bench_idset, "Benchmark the dedup id set"},
 		{"quantize", cmd_bench_quantize, "Benchmark quantization methods"},
 		{"cluster", cmd_bench_cluster, "Benchmark clustering algorithms"},
 		{"search", cmd_bench_search, "Benchmark end-to-end search"},

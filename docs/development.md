@@ -237,6 +237,15 @@ computation:
 
 Comparing SIMD implementations is covered in [simd.md](simd.md#cli-benchmarks).
 
+`bench idset` times the id set the candidate extract deduplicates with,
+and reports the longest run of occupied slots, the most slots a lookup
+walks:
+
+```bash
+# default: 1000, 10000 and 100000 posting-encoded TIDs
+./bin/vectorsearch bench idset
+```
+
 ## Profiling
 
 ### Quick Profiling with perf
