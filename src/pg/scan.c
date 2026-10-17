@@ -210,6 +210,9 @@ typedef struct PrismScanState
 	 * type -- an access, not the vector itself.
 	 */
 	Vec32Access query_vector_access;
+
+	/* Cached substitute for a NULL query vector; see null_query_vector. */
+	float *null_query;
 } PrismScanState;
 
 const PrismScanStats *
@@ -497,6 +500,29 @@ ensure_query_state(PrismScanState *ss, uint32_t k)
  * Search execution (called on first gettuple)
  * ---------------------------------------------------------------- */
 
+/*
+ * Query vector to search with when the ORDER BY argument is NULL. Every
+ * distance is NULL, so all rows tie and any rows satisfy the query; a fixed
+ * unit vector keeps the scan on its normal path. Built as float32 directly
+ * so a vec16 index gets the same vector, and cached for rescans.
+ */
+static Vec32Ref
+null_query_vector(PrismScanState *ss)
+{
+	if (ss->null_query == NULL)
+	{
+		MemoryContext old_ctx = MemoryContextSwitchTo(ss->scan_ctx);
+		Dimension	  dim	  = ss->index_base.dim;
+		float		 *unit	  = palloc0(sizeof(float) * dim);
+
+		unit[0] = 1.0f;
+		MemoryContextSwitchTo(old_ctx);
+		ss->null_query = unit;
+	}
+
+	return (Vec32Ref){.data = ss->null_query, .dim = ss->index_base.dim};
+}
+
 static void
 execute_search(IndexScanDesc scan)
 {
@@ -528,7 +554,13 @@ execute_search(IndexScanDesc scan)
 	 * one per execution. vec32_read rejects a dimension mismatch.
 	 */
 	Datum	 query_datum = scan->orderByData[0].sk_argument;
-	Vec32Ref qref		 = vec32_read(&ss->query_vector_access, query_datum);
+	Vec32Ref qref;
+
+	/* A NULL query vector cannot be searched; see null_query_vector. */
+	if (scan->orderByData[0].sk_flags & SK_ISNULL)
+		qref = null_query_vector(ss);
+	else
+		qref = vec32_read(&ss->query_vector_access, query_datum);
 
 	if (qref.dim != ss->index_base.dim)
 		ereport(ERROR,
