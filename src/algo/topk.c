@@ -326,16 +326,7 @@ vs_topk_insert_unique(
 
 	/* Grow candidate buffer if needed (old buffer freed with memctx) */
 	if (topk->cand_count == topk->cand_capacity)
-	{
-		uint32_t	 new_cap = topk->cand_capacity * 2;
-		VsTopKEntry *new_buf =
-				vs_memctx_alloc(topk->memctx, new_cap * sizeof(VsTopKEntry));
-		memcpy(new_buf,
-			   topk->candidates,
-			   topk->cand_count * sizeof(VsTopKEntry));
-		topk->candidates	= new_buf;
-		topk->cand_capacity = new_cap;
-	}
+		vs_topk_reserve(topk, topk->cand_capacity + 1);
 
 	topk->candidates[topk->cand_count++] = (VsTopKEntry){
 			.distance = distance,
@@ -399,16 +390,7 @@ vs_topk_insert(VsTopK *topk, Distance distance, Distance error, uint64_t id)
 append:
 	/* Grow candidate buffer if needed (old buffer freed with memctx) */
 	if (topk->cand_count == topk->cand_capacity)
-	{
-		uint32_t	 new_cap = topk->cand_capacity * 2;
-		VsTopKEntry *new_buf =
-				vs_memctx_alloc(topk->memctx, new_cap * sizeof(VsTopKEntry));
-		memcpy(new_buf,
-			   topk->candidates,
-			   topk->cand_count * sizeof(VsTopKEntry));
-		topk->candidates	= new_buf;
-		topk->cand_capacity = new_cap;
-	}
+		vs_topk_reserve(topk, topk->cand_capacity + 1);
 
 	/* Append to candidate buffer */
 	topk->candidates[topk->cand_count++] = (VsTopKEntry){
@@ -583,4 +565,122 @@ vs_topk_extract_sorted_unique(
 		radix_sort_by_distance(results, sort_buf(topk, out), out);
 
 	*count_out = out;
+}
+
+/*
+ * Grow the candidate buffer to hold at least `capacity` entries, never
+ * shrinking it. The append path knows how many entries it will score, so it
+ * reserves once instead of doubling through a series of reallocations.
+ */
+void
+vs_topk_reserve(VsTopK *topk, uint32_t capacity)
+{
+	if (topk->cand_capacity >= capacity)
+		return;
+
+	uint32_t	 want = topk->cand_capacity * 2;
+	VsTopKEntry *new_buf;
+
+	if (want < capacity)
+		want = capacity;
+
+	new_buf = vs_memctx_alloc(topk->memctx, want * sizeof(VsTopKEntry));
+	memcpy(new_buf, topk->candidates, topk->cand_count * sizeof(VsTopKEntry));
+	topk->candidates	= new_buf;
+	topk->cand_capacity = want;
+}
+
+/*
+ * Append a scored candidate without a threshold check or heap update. The
+ * buffer grows geometrically like the insert path's.
+ */
+void
+vs_topk_append(VsTopK *topk, Distance distance, uint64_t id)
+{
+	if (topk->cand_count == topk->cand_capacity)
+		vs_topk_reserve(topk, topk->cand_capacity + 1);
+
+	topk->candidates[topk->cand_count++] = (VsTopKEntry){
+			.distance = distance,
+			.error	  = 0.0f,
+			.id		  = id,
+			.src	  = topk->cur_src,
+	};
+}
+
+/*
+ * Select the best `keep` appended candidates by sorting the buffer once,
+ * stable, so candidates with equal distances keep the order the caller
+ * appended them in. The heap is not consulted and no candidate is dropped
+ * before the selection.
+ */
+uint32_t
+vs_topk_extract_best(VsTopK *topk, uint32_t keep)
+{
+	uint32_t n = topk->cand_count;
+
+	if (n == 0)
+		return 0;
+	if (n > 1)
+		radix_sort_by_distance(topk->candidates, sort_buf(topk, n), n);
+
+	return n < keep ? n : keep;
+}
+
+/*
+ * Sort candidate indices by encoded TID, block then offset, with a six-pass
+ * LSD radix sort over the 48-bit id, skipping a byte that is uniform across
+ * every id. The rerank's read stream coalesces adjacent block numbers into
+ * larger reads, so this order matters for cold data. Passes ping-pong
+ * between `order` and `scratch`, so the sorted order is copied back when the
+ * last pass landed in `scratch`; `scratch` must hold `count` entries.
+ */
+void
+vs_topk_sort_by_tid(
+		uint32_t		  *order,
+		uint32_t		  *scratch,
+		const VsTopKEntry *candidates,
+		uint32_t		   count)
+{
+	uint32_t *src = order;
+	uint32_t *dst = scratch;
+
+	if (count == 0)
+		return;
+
+	for (uint32_t shift = 0; shift < 48; shift += 8)
+	{
+		uint32_t counts[256] = {0};
+
+		for (uint32_t i = 0; i < count; i++)
+			counts[(candidates[src[i]].id >> shift) & 0xFF]++;
+
+		/* A byte that is the same for every TID orders nothing: the top
+		 * bytes are zero below 2^24 heap blocks, so most tables skip them. */
+		if (counts[(candidates[src[0]].id >> shift) & 0xFF] == count)
+			continue;
+
+		uint32_t sum = 0;
+
+		for (uint32_t d = 0; d < 256; d++)
+		{
+			uint32_t c = counts[d];
+
+			counts[d] = sum;
+			sum += c;
+		}
+
+		for (uint32_t i = 0; i < count; i++)
+			dst[counts[(candidates[src[i]].id >> shift) & 0xFF]++] = src[i];
+
+		uint32_t *tmp = src;
+
+		src = dst;
+		dst = tmp;
+	}
+
+	/* The pass count varies with the skips, so the result is not always in
+	 * `order` when the loop ends. */
+	if (src != order)
+		memcpy(order, src, count * sizeof(uint32_t));
 }

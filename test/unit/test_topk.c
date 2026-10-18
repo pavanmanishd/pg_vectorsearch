@@ -615,3 +615,183 @@ TEST(topk_extract_unique_negative_distances)
 	vs_free(res);
 	vs_topk_cleanup(&topk);
 }
+
+/*
+ * The pool-style path: append scored candidates without a heap, then
+ * select the best keep in one pass. Mirrors the rerank, which computes
+ * exact distances for a whole pool before choosing the top k.
+ */
+TEST(topk_append_extract_best)
+{
+	const uint32_t n	= 1000;
+	const uint32_t keep = 50;
+
+	VsTopK topk;
+
+	vs_topk_init(&topk, keep);
+
+	float *all_dists = vs_alloc(n * sizeof(float));
+	for (uint32_t i = 0; i < n; i++)
+	{
+		all_dists[i] = (float)((i * 97 + 13) % 1000) / 10.0f;
+		vs_topk_append(&topk, all_dists[i], (uint64_t)(i + 1));
+	}
+
+	uint32_t out = vs_topk_extract_best(&topk, keep);
+
+	ASSERT_EQ(keep, out, "extract_best returns keep entries");
+	for (uint32_t i = 1; i < out; i++)
+		ASSERT_TRUE(
+				topk.candidates[i - 1].distance <= topk.candidates[i].distance,
+				"extract_best sorted ascending");
+
+	/* Brute force: sort all distances and compare the first keep. */
+	for (uint32_t i = 0; i < n; i++)
+		for (uint32_t j = i + 1; j < n; j++)
+			if (all_dists[j] < all_dists[i])
+			{
+				float tmp	 = all_dists[i];
+				all_dists[i] = all_dists[j];
+				all_dists[j] = tmp;
+			}
+
+	for (uint32_t i = 0; i < keep; i++)
+	{
+		char msg[128];
+		snprintf(
+				msg,
+				sizeof(msg),
+				"best[%u] dist %.1f should match brute-force %.1f",
+				i,
+				topk.candidates[i].distance,
+				all_dists[i]);
+		ASSERT_FLOAT_EQ(all_dists[i], topk.candidates[i].distance, 1e-6f, msg);
+	}
+
+	vs_free(all_dists);
+	vs_topk_cleanup(&topk);
+}
+
+/* Equal distances keep the order they were appended in: the selection is
+ * stable, which is what lets the rerank produce TID order among ties by
+ * appending in TID order. */
+TEST(topk_append_extract_best_ties)
+{
+	const float	   dists[] = {5.0f, 1.0f, 5.0f, 1.0f, 3.0f, 1.0f, 5.0f, 3.0f};
+	const uint32_t n	   = sizeof(dists) / sizeof(dists[0]);
+	const uint32_t keep	   = 5;
+
+	VsTopK topk;
+
+	vs_topk_init(&topk, keep);
+	for (uint32_t i = 0; i < n; i++)
+		vs_topk_append(&topk, dists[i], (uint64_t)(i + 1));
+
+	uint32_t out = vs_topk_extract_best(&topk, keep);
+
+	ASSERT_EQ(keep, out, "extract_best returns keep entries");
+
+	/* The 1.0s arrive first (ids 2, 4, 6), then the 3.0s (ids 5, 8). */
+	const uint64_t expect[] = {2, 4, 6, 5, 8};
+
+	for (uint32_t i = 0; i < out; i++)
+	{
+		char msg[96];
+
+		snprintf(msg, sizeof(msg), "tie %u keeps its append order", i);
+		ASSERT_EQ((int)expect[i], (int)topk.candidates[i].id, msg);
+	}
+
+	vs_topk_cleanup(&topk);
+}
+
+/* An empty pool, a keep above the pool, and negative distances. */
+TEST(topk_append_extract_best_edges)
+{
+	VsTopK topk;
+
+	vs_topk_init(&topk, 8);
+
+	ASSERT_EQ(0, vs_topk_extract_best(&topk, 8), "empty pool selects nothing");
+
+	vs_topk_append(&topk, -2.5f, 1);
+	vs_topk_append(&topk, 0.0f, 2);
+	vs_topk_append(&topk, -7.5f, 3);
+
+	uint32_t out = vs_topk_extract_best(&topk, 8);
+
+	ASSERT_EQ(3, out, "keep above the pool returns the whole pool");
+	ASSERT_FLOAT_EQ(
+			-7.5f, topk.candidates[0].distance, 1e-6f, "most negative first");
+	ASSERT_FLOAT_EQ(0.0f, topk.candidates[2].distance, 1e-6f, "largest last");
+
+	vs_topk_cleanup(&topk);
+}
+
+/* A reserve covers the appends that follow, with no reallocation. */
+TEST(topk_reserve_presizes)
+{
+	VsTopK topk;
+
+	vs_topk_init(&topk, 0);
+	vs_topk_reserve(&topk, 1000);
+
+	ASSERT_TRUE(topk.cand_capacity >= 1000, "reserve grows the buffer");
+
+	uint32_t cap = topk.cand_capacity;
+
+	for (uint32_t i = 0; i < 1000; i++)
+		vs_topk_append(&topk, (float)i, (uint64_t)(i + 1));
+
+	ASSERT_EQ(1000, topk.cand_count, "all appends kept");
+	ASSERT_EQ((int)cap, (int)topk.cand_capacity, "no reallocation needed");
+
+	vs_topk_cleanup(&topk);
+}
+
+/* The TID sort ping-pongs between two buffers and skips bytes that are
+ * uniform across every id, so the number of passes varies with the table:
+ * the sorted order must land back in `order` whichever parity it ends on.
+ * One block runs two passes, 512 blocks with byte-sized offsets run three. */
+TEST(topk_sort_by_tid_pass_counts)
+{
+	enum
+	{
+		N = 512
+	};
+
+	VsTopKEntry cand[N];
+	uint32_t	order[N];
+	uint32_t	scratch[N];
+
+	/* One block: bytes 0 and 1 vary, so two passes. */
+	for (uint32_t i = 0; i < N; i++)
+		cand[i] = (VsTopKEntry){.distance = 0.0f,
+								.id		  = ((uint64_t)7 << 16) | (N - i)};
+
+	for (uint32_t i = 0; i < N; i++)
+		order[i] = i;
+
+	vs_topk_sort_by_tid(order, scratch, cand, N);
+
+	for (uint32_t i = 1; i < N; i++)
+		ASSERT_TRUE(
+				cand[order[i - 1]].id < cand[order[i]].id,
+				"single-pass result is sorted in order");
+
+	/* 512 blocks with offsets below 256: bytes 0, 2 and 3 vary, so three
+	 * passes run. */
+	for (uint32_t i = 0; i < N; i++)
+		cand[i] = (VsTopKEntry){.distance = 0.0f,
+								.id = ((uint64_t)(N - i) << 16) | (i & 0xFF)};
+
+	for (uint32_t i = 0; i < N; i++)
+		order[i] = i;
+
+	vs_topk_sort_by_tid(order, scratch, cand, N);
+
+	for (uint32_t i = 1; i < N; i++)
+		ASSERT_TRUE(
+				cand[order[i - 1]].id < cand[order[i]].id,
+				"three-pass result is sorted in order");
+}

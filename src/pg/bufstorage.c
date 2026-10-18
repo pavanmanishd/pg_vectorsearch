@@ -324,25 +324,6 @@ pg_extend(VsStorage *self, uint32_t npages)
  * Rerank: fetch vectors from heap, compute exact L2
  * ---------------------------------------------------------------- */
 
-/* Comparator for sorting candidate indices by TID block order */
-static int
-cmp_tid_order(const void *a, const void *b, void *arg)
-{
-	const VsTopKEntry *cands = arg;
-
-	/* Encoded ids are (block << 16) | offset — strictly monotonic in
-	 * (block, offset), so raw id comparison IS TID order; no need to
-	 * decode both TIDs on every comparison. */
-	uint64_t id_a = cands[*(const uint32_t *)a].id;
-	uint64_t id_b = cands[*(const uint32_t *)b].id;
-
-	if (id_a < id_b)
-		return -1;
-	if (id_a > id_b)
-		return 1;
-	return 0;
-}
-
 /*
  * pg_rerank - Rerank candidates with exact L2 distances.
  *
@@ -385,14 +366,19 @@ pg_rerank(
 	Vec32Access input = vec32_access(s->type_info, dim, CurrentMemoryContext);
 
 	/* Sort by TID block order for sequential I/O */
-	uint32_t *order = palloc(count * sizeof(uint32_t));
+	uint32_t *order	  = palloc(count * sizeof(uint32_t));
+	uint32_t *scratch = palloc(count * sizeof(uint32_t));
 	for (uint32_t i = 0; i < count; i++)
 		order[i] = i;
-	qsort_arg(
-			order, count, sizeof(uint32_t), cmp_tid_order, (void *)candidates);
+	vs_topk_sort_by_tid(order, scratch, candidates, count);
+	pfree(scratch);
 
 	VsTopK topk;
-	vs_topk_init(&topk, keep);
+
+	/* The append path never touches the threshold heap and the pool size is
+	 * known here, so the candidate buffer is reserved once. */
+	vs_topk_init(&topk, 0);
+	vs_topk_reserve(&topk, count);
 
 	TupleTableSlot *slot = table_slot_create(s->rel, NULL);
 
@@ -430,22 +416,19 @@ pg_rerank(
 			}
 		}
 
-		vs_topk_insert_unique(&topk, d, 0.0f, (uint64_t)idx);
+		vs_topk_append(&topk, d, (uint64_t)idx);
 	}
 
 	ExecDropSingleTupleTableSlot(slot);
 
-	VsTopKEntry *entries = palloc(topk.cand_count * sizeof(VsTopKEntry));
-	uint32_t	 nresults;
-	vs_topk_extract_sorted_unique(&topk, entries, &nresults);
+	uint32_t nresults = vs_topk_extract_best(&topk, keep);
 
 	for (uint32_t i = 0; i < nresults; i++)
 	{
-		out_indices[i]	 = (uint32_t)entries[i].id;
-		out_distances[i] = entries[i].distance;
+		out_indices[i]	 = (uint32_t)topk.candidates[i].id;
+		out_distances[i] = topk.candidates[i].distance;
 	}
 
-	pfree(entries);
 	vs_topk_cleanup(&topk);
 	pfree(order);
 
@@ -465,7 +448,7 @@ typedef struct RerankStreamState
 {
 	const VsTopKEntry *candidates;
 	const uint32_t	  *order;
-	VsTopK			  *topk;
+	Distance		  *dists; /* [count], scored by index */
 	VsPgStorage		  *storage;
 	uint32_t		   count;
 	uint32_t		   pos;
@@ -481,14 +464,11 @@ rerank_stream_cb(
 	{
 		uint32_t idx = st->order[st->pos++];
 
-		/* Already exact — insert directly, no heap fetch */
+		/* Already exact: record it, no heap fetch. Scoring is recorded by
+		 * index and appended after the stream ends, in TID order. */
 		if (st->candidates[idx].error == 0.0f)
 		{
-			vs_topk_insert_unique(
-					st->topk,
-					st->candidates[idx].distance,
-					0.0f,
-					(uint64_t)idx);
+			st->dists[idx] = st->candidates[idx].distance;
 			continue;
 		}
 
@@ -521,19 +501,36 @@ pg_rerank_readstream(
 	/* See pg_rerank: one widening buffer per call, not per candidate. */
 	Vec32Access input = vec32_access(s->type_info, dim, CurrentMemoryContext);
 
-	uint32_t *order = palloc(count * sizeof(uint32_t));
+	uint32_t *order	  = palloc(count * sizeof(uint32_t));
+	uint32_t *scratch = palloc(count * sizeof(uint32_t));
 	for (uint32_t i = 0; i < count; i++)
 		order[i] = i;
-	qsort_arg(
-			order, count, sizeof(uint32_t), cmp_tid_order, (void *)candidates);
+	vs_topk_sort_by_tid(order, scratch, candidates, count);
+	pfree(scratch);
+
+	/* Scored distances, recorded by candidate index and appended in TID
+	 * order after the stream ends; see the loop below. Start from the
+	 * approximate distance so a candidate the stream does not deliver still
+	 * has a defined score. */
+	Distance *dists = palloc(count * sizeof(Distance));
+
+	for (uint32_t i = 0; i < count; i++)
+		dists[i] = candidates[i].distance;
 
 	VsTopK topk;
-	vs_topk_init(&topk, keep);
+
+	/*
+	 * The append path never touches the threshold heap, and the pool size is
+	 * known here, so the candidate buffer is reserved once rather than grown
+	 * through a series of reallocations.
+	 */
+	vs_topk_init(&topk, 0);
+	vs_topk_reserve(&topk, count);
 
 	RerankStreamState state = {
 			.candidates = candidates,
 			.order		= order,
-			.topk		= &topk,
+			.dists		= dists,
 			.storage	= s,
 			.count		= count,
 			.pos		= 0,
@@ -586,25 +583,37 @@ pg_rerank_readstream(
 			ExecClearTuple(slot);
 		}
 
-		vs_topk_insert_unique(&topk, d, 0.0f, (uint64_t)idx);
+		dists[idx] = d;
 		ReleaseBuffer(buf);
 	}
 
 	read_stream_end(stream);
 	ExecDropSingleTupleTableSlot(slot);
 
-	VsTopKEntry *entries = palloc(topk.cand_count * sizeof(VsTopKEntry));
-	uint32_t	 nresults;
-	vs_topk_extract_sorted_unique(&topk, entries, &nresults);
+	/*
+	 * Append in TID order, the order the stream walks. The callback runs at
+	 * look-ahead time, so appending as each candidate is scored would order
+	 * equal distances by whatever the stream happened to prefetch; the
+	 * selection keeps the append order among ties, and this pass is what
+	 * makes a tie come out in TID order.
+	 */
+	for (uint32_t i = 0; i < count; i++)
+	{
+		uint32_t idx = order[i];
+
+		vs_topk_append(&topk, dists[idx], (uint64_t)idx);
+	}
+
+	uint32_t nresults = vs_topk_extract_best(&topk, keep);
 
 	for (uint32_t i = 0; i < nresults; i++)
 	{
-		out_indices[i]	 = (uint32_t)entries[i].id;
-		out_distances[i] = entries[i].distance;
+		out_indices[i]	 = (uint32_t)topk.candidates[i].id;
+		out_distances[i] = topk.candidates[i].distance;
 	}
 
-	pfree(entries);
 	vs_topk_cleanup(&topk);
+	pfree(dists);
 	pfree(order);
 
 	return nresults;

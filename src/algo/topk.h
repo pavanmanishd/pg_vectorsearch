@@ -164,4 +164,37 @@ void vs_topk_extract_sorted(
 void vs_topk_extract_sorted_unique(
 		VsTopK *topk, VsTopKEntry *results, uint32_t *count_out);
 
+/*
+ * Append a scored candidate without a threshold check or heap update.
+ * For callers that score a whole pool in one pass and select afterwards,
+ * such as the rerank, where a per-candidate heap insert costs more than
+ * one selection at the end.
+ */
+void vs_topk_append(VsTopK *topk, Distance distance, uint64_t id);
+
+/*
+ * Grow the candidate buffer to hold at least `capacity` entries, never
+ * shrinking it. Callers that know how many candidates they will append can
+ * reserve once instead of growing through a series of reallocations.
+ */
+void vs_topk_reserve(VsTopK *topk, uint32_t capacity);
+
+/*
+ * Sort `count` candidate indices in `order` by encoded TID (block then
+ * offset), using `scratch` as the ping-pong buffer, and leave the sorted
+ * order in `order` whatever number of passes ran.
+ */
+void vs_topk_sort_by_tid(
+		uint32_t		  *order,
+		uint32_t		  *scratch,
+		const VsTopKEntry *candidates,
+		uint32_t		   count);
+
+/*
+ * Select the best `keep` appended candidates by distance, sorted
+ * ascending, and return how many were selected. The selected entries are
+ * the first `keep` of topk->candidates. No threshold filter is applied.
+ */
+uint32_t vs_topk_extract_best(VsTopK *topk, uint32_t keep);
+
 #endif /* VS_TOPK_H */
