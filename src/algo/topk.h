@@ -69,6 +69,8 @@ typedef struct VsTopK
 	VsTopKEntry *candidates;	/* growable candidate buffer */
 	uint32_t	 cand_count;	/* buffered candidates */
 	uint32_t	 cand_capacity; /* allocated capacity */
+	VsTopKEntry *sort_buf;		/* radix-sort ping-pong buffer */
+	uint32_t	 sort_buf_cap;	/* allocated capacity */
 	uint32_t	 cur_src;		/* diagnostic: rank stamped onto inserts */
 	VsMemCtx	 memctx;		/* owning context for all allocations */
 } VsTopK;

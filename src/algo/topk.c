@@ -99,19 +99,93 @@ ub_sift_down_from(Distance *heap, uint64_t *ids, uint32_t count, uint32_t i)
 }
 
 /* ----------------------------------------------------------------
- * Comparator for qsort (ascending by distance)
+ * Distance sort
  * ---------------------------------------------------------------- */
 
-static int
-cmp_by_distance(const void *a, const void *b)
+/*
+ * Monotonic 32-bit key for a float distance: comparing keys compares
+ * distances. Flips the sign bit of non-negative values and inverts
+ * negative ones, the usual IEEE-754 total-order mapping, and maps every
+ * NaN to the largest key so NaNs sort after every number.
+ */
+static inline uint32_t
+distance_key(Distance d)
 {
-	const VsTopKEntry *ea = (const VsTopKEntry *)a;
-	const VsTopKEntry *eb = (const VsTopKEntry *)b;
-	if (ea->distance < eb->distance)
-		return -1;
-	if (ea->distance > eb->distance)
-		return 1;
-	return 0;
+	union
+	{
+		float	 f;
+		uint32_t u;
+	} v = {.f = d};
+
+	/* -0.0 and +0.0 are the same distance, so key them alike. */
+	if (v.u == 0x80000000u)
+		v.u = 0;
+
+	/* NaN: exponent all ones with a non-zero mantissa, either sign. */
+	if ((v.u & 0x7fffffffu) > 0x7f800000u)
+		return UINT32_MAX;
+
+	return (v.u & 0x80000000u) ? ~v.u : (v.u | 0x80000000u);
+}
+
+/* Scratch of at least n entries, grown geometrically in the top-K's
+ * context. */
+static VsTopKEntry *
+sort_buf(VsTopK *topk, uint32_t n)
+{
+	if (topk->sort_buf_cap < n)
+	{
+		uint32_t want = n;
+		uint32_t grow = topk->sort_buf_cap * 2;
+
+		if (grow > want)
+			want = grow;
+
+		topk->sort_buf =
+				vs_memctx_alloc(topk->memctx, want * sizeof(VsTopKEntry));
+		topk->sort_buf_cap = want;
+	}
+
+	return topk->sort_buf;
+}
+
+/*
+ * Sort entries by distance ascending with a four-pass LSD radix sort over
+ * the distance keys. Stable, so equal distances keep their arrival order.
+ * The two buffers ping-pong and the even pass count lands the sorted
+ * order back in `a`.
+ */
+static void
+radix_sort_by_distance(VsTopKEntry *a, VsTopKEntry *scratch, uint32_t n)
+{
+	VsTopKEntry *src = a;
+	VsTopKEntry *dst = scratch;
+
+	for (uint32_t shift = 0; shift < 32; shift += 8)
+	{
+		uint32_t count[256] = {0};
+
+		for (uint32_t i = 0; i < n; i++)
+			count[(distance_key(src[i].distance) >> shift) & 0xFF]++;
+
+		uint32_t sum = 0;
+		for (uint32_t d = 0; d < 256; d++)
+		{
+			uint32_t c = count[d];
+
+			count[d] = sum;
+			sum += c;
+		}
+
+		for (uint32_t i = 0; i < n; i++)
+			dst[count[(distance_key(src[i].distance) >> shift) & 0xFF]++] =
+					src[i];
+
+		VsTopKEntry *tmp = src;
+
+		src = dst;
+		dst = tmp;
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -135,6 +209,8 @@ vs_topk_init(VsTopK *topk, uint32_t k)
 			vs_memctx_alloc(topk->memctx, cap * sizeof(VsTopKEntry));
 	topk->cand_count	= 0;
 	topk->cand_capacity = cap;
+	topk->sort_buf		= NULL;
+	topk->sort_buf_cap	= 0;
 	/* Stamped onto every insert; only the query scan ever sets it. */
 	topk->cur_src = 0;
 }
@@ -149,9 +225,11 @@ vs_topk_cleanup(VsTopK *topk)
 		vs_memctx_delete(topk->memctx);
 		topk->memctx = NULL;
 	}
-	topk->ub_heap	 = NULL;
-	topk->ub_ids	 = NULL;
-	topk->candidates = NULL;
+	topk->ub_heap	   = NULL;
+	topk->ub_ids	   = NULL;
+	topk->candidates   = NULL;
+	topk->sort_buf	   = NULL;
+	topk->sort_buf_cap = 0;
 }
 
 VsTopK *
@@ -206,6 +284,8 @@ vs_topk_reset_to_k(VsTopK *topk, uint32_t k)
 		topk->candidates =
 				vs_memctx_alloc(topk->memctx, cand_cap * sizeof(VsTopKEntry));
 		topk->cand_capacity = cand_cap;
+		topk->sort_buf		= NULL;
+		topk->sort_buf_cap	= 0;
 		topk->k_capacity	= k;
 	}
 
@@ -472,7 +552,7 @@ vs_topk_extract_sorted_capped(
 	}
 
 	if (sel > 1)
-		qsort(results, sel, sizeof(VsTopKEntry), cmp_by_distance);
+		radix_sort_by_distance(results, sort_buf(topk, sel), sel);
 
 	*count_out = dedup_sorted_prefix(results, sel, cap);
 }
@@ -500,7 +580,7 @@ vs_topk_extract_sorted_unique(
 
 	/* Sort by distance ascending */
 	if (out > 1)
-		qsort(results, out, sizeof(VsTopKEntry), cmp_by_distance);
+		radix_sort_by_distance(results, sort_buf(topk, out), out);
 
 	*count_out = out;
 }

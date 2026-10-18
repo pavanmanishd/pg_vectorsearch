@@ -97,7 +97,7 @@ SELECT id FROM default_items ORDER BY v <-> '[0,0,0,0]'::vec32(4) LIMIT 3;
 ----
   6
  12
- 10
+  3
 (3 rows)
 
 RESET enable_seqscan;

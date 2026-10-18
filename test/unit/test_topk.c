@@ -512,16 +512,17 @@ TEST(topk_reset)
 
 /* Adversarial distance distributions for the quickselect partition:
  * all-equal (pivot-equal band), sorted, reverse-sorted, two-valued,
- * and scattered, each with duplicate ids (SOAR-style replicas). The
- * capped extract must return exactly the cap best unique ids, sorted;
- * bounds bugs in the partition surface under the sanitizer jobs. */
+ * scattered, and negative (inner product), each with duplicate ids
+ * (SOAR-style replicas). The capped extract must return exactly the cap
+ * best unique ids, sorted; bounds bugs in the partition surface under
+ * the sanitizer jobs. */
 TEST(topk_extract_capped_adversarial)
 {
 	const uint32_t n	  = 500;
 	const uint32_t k	  = 10;
 	const uint32_t caps[] = {1, 10, 33, 160, 500, 1000};
 
-	for (int dist_kind = 0; dist_kind < 5; dist_kind++)
+	for (int dist_kind = 0; dist_kind < 6; dist_kind++)
 	{
 		for (size_t c = 0; c < sizeof(caps) / sizeof(caps[0]); c++)
 		{
@@ -546,8 +547,11 @@ TEST(topk_extract_capped_adversarial)
 				case 3:
 					d = (float)(i % 2);
 					break;
-				default:
+				case 4:
 					d = (float)((i * 7919u) % 257u);
+					break;
+				default:
+					d = -(float)((i * 7919u) % 257u);
 					break;
 				}
 				vs_topk_insert(&topk, d, 1000.0f, (uint64_t)(i % 250) + 1);
@@ -571,4 +575,43 @@ TEST(topk_extract_capped_adversarial)
 			vs_topk_cleanup(&topk);
 		}
 	}
+}
+
+/*
+ * The unique extract has no dedup pass, so it is the direct check on the
+ * distance sort: negative distances (inner product) come first, the two
+ * zeros tie, and the order is ascending end to end.
+ */
+TEST(topk_extract_unique_negative_distances)
+{
+	const float dists[] =
+			{-3.5f, 0.0f, 2.5f, -0.0f, -1.25f, 4.0f, -2.0f, 0.5f, -4.5f, 1.5f};
+	const uint32_t n = sizeof(dists) / sizeof(dists[0]);
+
+	VsTopK topk;
+
+	vs_topk_init(&topk, 8);
+	for (uint32_t i = 0; i < n; i++)
+		vs_topk_insert_unique(&topk, dists[i], 0.0f, (uint64_t)(i + 1));
+
+	VsTopKEntry *res = vs_alloc(topk.cand_count * sizeof(VsTopKEntry));
+	uint32_t	 out;
+
+	vs_topk_extract_sorted_unique(&topk, res, &out);
+
+	ASSERT_EQ(8, out, "unique extract returns k entries");
+	ASSERT_EQ(-4.5f, res[0].distance, "most negative distance first");
+	ASSERT_EQ(1.5f, res[out - 1].distance, "smallest admitted distance last");
+	for (uint32_t i = 1; i < out; i++)
+		ASSERT_TRUE(
+				res[i - 1].distance <= res[i].distance,
+				"unique extract sorted ascending");
+
+	/* -0.0 and +0.0 are the same distance, so the sort must keep the order
+	 * they arrived in instead of ranking one below the other. */
+	ASSERT_EQ(2, (int)res[4].id, "the +0.0 row sorts first at equal keys");
+	ASSERT_EQ(4, (int)res[5].id, "the -0.0 row keeps its arrival order");
+
+	vs_free(res);
+	vs_topk_cleanup(&topk);
 }
