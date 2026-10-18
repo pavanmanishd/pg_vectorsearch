@@ -1191,6 +1191,7 @@ prism_refine_write_means(
 		uint32_t		 lo,
 		uint32_t		 hi,
 		Dimension		 dim,
+		bool			 cosine,
 		float			*scratch,
 		PrismLeafWriteFn write_head,
 		void			*write_head_ctx)
@@ -1203,6 +1204,15 @@ prism_refine_write_means(
 		double		  inv = 1.0 / (double)counts[l - lo];
 		for (Dimension j = 0; j < dim; j++)
 			scratch[j] = (float)(sum[j] * inv);
+
+		/* Cosine references live on the unit sphere, exactly like the
+		 * sample-trained centroids the tree write normalizes before the
+		 * head references are written from them: the mean of normalized
+		 * rows drifts below unit norm, and a reference that is not unit
+		 * norm biases the RaBitQ residuals it centers. */
+		if (cosine)
+			vs_l2_normalize(scratch, dim);
+
 		write_head(write_head_ctx, l, scratch);
 	}
 }

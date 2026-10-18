@@ -821,6 +821,7 @@ serial_refine_heads(
 				lo,
 				hi,
 				dim,
+				rs.cosine,
 				rs.scratch,
 				prism_write_leaf_head,
 				headctx);

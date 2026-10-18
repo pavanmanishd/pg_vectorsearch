@@ -214,7 +214,10 @@ const float *prism_refine_route_row(
 /*
  * Divide one tile's sums by their counts and hand each refined leaf mean to
  * write_head (leaves with no routed rows keep their sample-trained head).
- * scratch is a caller-owned [dim] float buffer.
+ * scratch is a caller-owned [dim] float buffer. cosine normalizes each mean
+ * to unit norm before it is written, matching every other centroid write
+ * path: a cosine reference must live on the unit sphere or the RaBitQ
+ * residuals it centers are biased.
  */
 typedef void (*PrismLeafWriteFn)(void *ctx, uint32_t leaf, const float *vec);
 
@@ -316,6 +319,7 @@ void prism_refine_write_means(
 		uint32_t		 lo,
 		uint32_t		 hi,
 		Dimension		 dim,
+		bool			 cosine,
 		float			*scratch,
 		PrismLeafWriteFn write_head,
 		void			*write_head_ctx);

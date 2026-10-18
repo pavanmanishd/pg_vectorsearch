@@ -760,6 +760,7 @@ prism_pbuild_exec_refine_paged(
 						lo,
 						hi,
 						dim,
+						rs.cosine,
 						rs.scratch,
 						write_head,
 						write_head_ctx);
