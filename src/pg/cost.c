@@ -28,6 +28,7 @@
 #include <optimizer/optimizer.h>
 #include <storage/bufmgr.h>
 #include <storage/lmgr.h>
+#include <utils/float.h>
 #include <utils/lsyscache.h>
 #include <utils/rel.h>
 #include <utils/selfuncs.h>
@@ -65,7 +66,8 @@ typedef struct CostInputs
 	 * nprobe are then scanned. Equal to nprobe with exact centroid pages,
 	 * larger when compressed ones make probe expansion worthwhile.
 	 */
-	uint32_t k_eff; /* rows it will elect */
+	uint32_t k_eff;		  /* rows it will elect */
+	double	 rows_pulled; /* rows the query will pull from the scan */
 	double	 beam;
 	/*
 	 * Candidates the beam search keeps at each level -- not the tree's
@@ -113,16 +115,27 @@ typedef struct CostInputs
  * rank; and an outer LIMIT above a join or CTE, where both agree on
  * unbounded.
  */
+/*
+ * Rows the planner knows the query will pull: a LIMIT it can fold, or a
+ * tuple fraction that resolved to an absolute count. Zero when it can only
+ * guess.
+ */
+static double
+known_row_bound(PlannerInfo *root)
+{
+	if (root->limit_tuples > 0.0 && isfinite(root->limit_tuples))
+		return root->limit_tuples;
+	if (root->tuple_fraction >= 1.0 && isfinite(root->tuple_fraction))
+		return root->tuple_fraction;
+	return 0.0;
+}
+
 static uint32_t
 row_target(PlannerInfo *root, double heap_rows)
 {
-	double rows = -1.0;
+	double rows = known_row_bound(root);
 
-	if (root->limit_tuples > 0.0 && isfinite(root->limit_tuples))
-		rows = root->limit_tuples;
-	else if (root->tuple_fraction >= 1.0 && isfinite(root->tuple_fraction))
-		rows = root->tuple_fraction;
-	else if (root->tuple_fraction > 0.0)
+	if (rows == 0.0 && root->tuple_fraction > 0.0)
 		rows = root->tuple_fraction * heap_rows;
 
 	if (rows < 1.0)
@@ -311,9 +324,19 @@ gather_cost_inputs(
 	 * LIMIT still produces a usable search, and a work_mem-derived cap. With
 	 * no LIMIT to size from it uses the row count instead.
 	 */
-	uint32_t k = prism_scan_inflate_for_filter(row_target(root, N), sel);
+	uint32_t demand = row_target(root, N);
 
-	in->k_eff = prism_scan_resolve_top_k(k, N);
+	in->k_eff = prism_scan_resolve_top_k(
+			prism_scan_inflate_for_filter(demand, sel), N);
+
+	/* Rows the query is known to pull; 0 when the planner can only guess.
+	 * Only the index's own clauses reach sel, so a filter above the scan
+	 * does not inflate it. */
+	in->rows_pulled = known_row_bound(root);
+
+	/* A pool cannot return more rows than the relation has. */
+	if (in->rows_pulled > N)
+		in->rows_pulled = N;
 
 	/*
 	 * Posting lists this query will scan: pinned by prism.nprobe when that is
@@ -715,6 +738,41 @@ prism_cost_estimate(
 	double		  sel;
 
 	gather_cost_inputs(root, path, loop_count, &in, &sel);
+
+	/*
+	 * The scan elects its whole top-k before it returns the first row, and
+	 * the pool is bounded by work_mem. A query that is known to pull more
+	 * rows than the pool holds cannot be answered by this path: reporting
+	 * end-of-scan early would leave the executor short, which is the silent
+	 * truncation this guard exists to prevent. Price the path as unable, the
+	 * way the access method's costestimate refuses a path with no order-by,
+	 * so seqscan + sort answers the query instead.
+	 *
+	 * Only a demand the planner knows counts. A fractional tuple fraction (a
+	 * cursor, a generic plan's LIMIT $1, an unfoldable LIMIT on a correlated
+	 * scan) and a query with no bound the planner can attribute both leave
+	 * rows_pulled at 0: the executor sizes those from the plan tree at
+	 * rescan, and refusing the path on a guess would trade a correct index
+	 * plan for a full sort of the table. An outer LIMIT over the subquery
+	 * holding the ORDER BY is not one of those: set_subquery_pathlist hands
+	 * it down as an absolute tuple fraction, so it counts.
+	 *
+	 * prism.query_limit is the deliberate exception: an explicit cap on the
+	 * rows a query may return is what that lever is for, so a query whose
+	 * pool is bounded by it keeps the index path. A query_limit that did not
+	 * bind is no help -- the pool was capped by work_mem, not by the user.
+	 */
+	if (in.rows_pulled > (double)in.k_eff &&
+		!(prism_query_limit > 0 && (uint32_t)prism_query_limit <= in.k_eff))
+	{
+		*startup_cost			  = get_float8_infinity();
+		*total_cost				  = get_float8_infinity();
+		*selectivity			  = 0;
+		*correlation			  = 0;
+		*index_pages			  = 0;
+		path->path.disabled_nodes = 2;
+		return;
+	}
 
 	double per_scan_cost = PRISM_COST_SCAN_SETUP + centroid_descent_cost(&in) +
 						   posting_cpu_cost(&in) +

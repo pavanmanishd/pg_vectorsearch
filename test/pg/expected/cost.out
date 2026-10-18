@@ -741,6 +741,143 @@ ROLLBACK;
 -- no index in this file reaches is a third level -- the clustering would
 -- need far more rows than a regression test should build -- so the deeper
 -- recursion of that branch is unexercised.
+-- ============================================================
+-- Sizing the scan to what the query pulls
+--
+-- A scan elects its whole top-k up front and work_mem bounds that pool. A
+-- query the planner knows will pull more rows than the pool holds cannot be
+-- answered by the index: the scan would report end-of-scan early and leave
+-- the executor short, silently truncating the result (issue #187). The
+-- planner falls back to seqscan + sort, which returns the complete answer.
+--
+-- A demand the planner cannot bound -- a fractional tuple fraction (a
+-- cursor, a generic LIMIT $1, a correlated LIMIT), or no bound it can
+-- attribute to the scan -- keeps the index path: the executor sizes those
+-- from the plan tree at rescan, and refusing them on a guess would trade a
+-- correct index plan for a full sort. An outer LIMIT over the subquery
+-- holding the ORDER BY is handed down as an absolute tuple fraction, so it
+-- counts as a known demand like any other.
+-- ============================================================
+SET work_mem = '64kB';
+-- The pool here is about a hundred rows, far short of the LIMIT.
+SELECT NOT plan_uses($q$
+    SELECT id FROM cost_test
+    ORDER BY v <-> qv()
+    LIMIT 1000$q$, 'idx_cost') AS truncated_limit_avoids_index;
+ truncated_limit_avoids_index 
+------------------------------
+ t
+(1 row)
+
+-- The same query answered by the fallback must be complete.
+SELECT count(*) AS rows_returned FROM (
+    SELECT id FROM cost_test ORDER BY v <-> qv() LIMIT 1000) s;
+ rows_returned 
+---------------
+          1000
+(1 row)
+
+-- A LIMIT the pool covers keeps the index path: the ordinary ANN query is
+-- untouched by the guard.
+SELECT plan_uses($q$
+    SELECT id FROM cost_test
+    ORDER BY v <-> qv()
+    LIMIT 10$q$, 'idx_cost') AS small_limit_keeps_index;
+ small_limit_keeps_index 
+-------------------------
+ t
+(1 row)
+
+-- An explicit prism.query_limit is the deliberate exception: capping the
+-- rows a query returns is what that lever is for, so a query whose pool is
+-- bounded by it keeps the index path and returns the cap.
+SET prism.query_limit = 50;
+SELECT plan_uses($q$
+    SELECT id FROM cost_test
+    ORDER BY v <-> qv()
+    LIMIT 1000$q$, 'idx_cost') AS query_limit_keeps_index;
+ query_limit_keeps_index 
+-------------------------
+ t
+(1 row)
+
+SELECT count(*) AS query_limit_caps FROM (
+    SELECT id FROM cost_test ORDER BY v <-> qv() LIMIT 1000) s;
+ query_limit_caps 
+------------------
+               50
+(1 row)
+
+-- A query_limit below the sizing floor still binds: the pool is floored to
+-- the built-in default, and the cap is what bounds it.
+SET prism.query_limit = 5;
+SELECT plan_uses($q$
+    SELECT id FROM cost_test
+    ORDER BY v <-> qv()
+    LIMIT 1000$q$, 'idx_cost') AS small_query_limit_keeps_index;
+ small_query_limit_keeps_index 
+-------------------------------
+ t
+(1 row)
+
+RESET prism.query_limit;
+-- A query_limit above the pool does not bind: work_mem is still what caps
+-- the sizing, so the path is refused like any other short pool.
+SET prism.query_limit = 1000;
+SELECT NOT plan_uses($q$
+    SELECT id FROM cost_test
+    ORDER BY v <-> qv()
+    LIMIT 1000$q$, 'idx_cost') AS nonbinding_query_limit_avoids_index;
+ nonbinding_query_limit_avoids_index 
+-------------------------------------
+ t
+(1 row)
+
+RESET prism.query_limit;
+-- A bound the planner cannot attribute, or a fractional guess, is not a
+-- demand: a correlated LIMIT and a generic prepared statement keep the
+-- index path, because the executor sizes them from the plan tree at rescan.
+SELECT plan_uses($q$
+    SELECT o.n, s.id FROM (VALUES (10), (20)) o(n),
+        LATERAL (SELECT id FROM cost_test ORDER BY v <-> qv()
+                 LIMIT o.n) s$q$, 'idx_cost') AS correlated_limit_keeps_index;
+ correlated_limit_keeps_index 
+------------------------------
+ t
+(1 row)
+
+SET plan_cache_mode = force_generic_plan;
+PREPARE guard_probe(vec32, int) AS
+    SELECT id FROM cost_test ORDER BY v <-> $1 LIMIT $2;
+SELECT plan_uses($q$EXECUTE guard_probe(qv(), 10)$q$,
+                 'idx_cost') AS generic_plan_keeps_index;
+ generic_plan_keeps_index 
+--------------------------
+ t
+(1 row)
+
+DEALLOCATE guard_probe;
+RESET plan_cache_mode;
+-- The outer LIMIT over the subquery holding the ORDER BY is handed down as
+-- an absolute tuple fraction, so it is a known demand: above the pool the
+-- path is refused like any other.
+SELECT NOT plan_uses($q$
+    SELECT * FROM (SELECT id FROM cost_test ORDER BY v <-> qv()) s
+    LIMIT 1000$q$, 'idx_cost') AS outer_limit_above_pool_avoids_index;
+ outer_limit_above_pool_avoids_index 
+-------------------------------------
+ t
+(1 row)
+
+SELECT count(*) AS rows_returned FROM (
+    SELECT * FROM (SELECT id FROM cost_test ORDER BY v <-> qv()) s
+    LIMIT 1000) t;
+ rows_returned 
+---------------
+          1000
+(1 row)
+
+RESET work_mem;
 DROP FUNCTION record_cost(text, int);
 DROP FUNCTION qv();
 DROP TABLE wide_vec, wide_plain, cost_mid;

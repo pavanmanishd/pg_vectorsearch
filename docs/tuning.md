@@ -64,15 +64,26 @@ proximity, whose survivors are not spread through the top-k the way the
 estimate assumes, can still come up short; a partial index on the filter
 avoids the estimate entirely.
 
-The top-k heap is bounded by `work_mem`. A query asking for more -- a
-large `LIMIT`, or a selective filter inflating the sizing -- returns as
-many rows as that budget affords, and **raising `work_mem` is how to ask
-for more**.
+The top-k heap is bounded by `work_mem`. When the scan is sized for a
+`LIMIT` that budget cannot cover, the planner declines the index path and
+answers the query with a sequential scan and a sort, so the result is
+complete; **raising `work_mem` is how to get the index back**. Two cases
+still return fewer rows than asked for: a query the planner cannot size
+from -- no `LIMIT`, one it cannot attribute to the scan (a `LIMIT` above a
+subquery holding the `ORDER BY` when that subquery sits under a join, or a
+materialized CTE), or one whose bound only exists at run time (a generic
+plan's `LIMIT $1`, a correlated `LIMIT`, a cursor) -- and a
+selective filter whose survivors come up short of the `LIMIT`. The guard is
+a plan-time check: it can only act on the bound the planner sees, so those
+shapes fall back to returning what the pool holds. For them, **raising
+`work_mem` is how to ask for more**.
 
 If none of the above mechanisms for managing the size of the top-k heap
 are sufficient, the `prism.query_limit` GUC is a manual lever to cap the
 number of tuples returned when the query lacks a `LIMIT` or it is set
-very high.
+very high. Capping is deliberate, so a query whose sizing this lever
+bounds keeps the index path even when the cap is below the `LIMIT` the
+query asked for.
 
 - **Default:** `0` = size from the query's `LIMIT`, never below 10; with
   no usable `LIMIT` the query has asked for every row in order, so the
