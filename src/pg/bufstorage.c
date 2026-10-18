@@ -560,23 +560,43 @@ pg_rerank_readstream(
 		uint32_t		idx = *(uint32_t *)per_buffer_data;
 		ItemPointerData tid = prism_posting_decode_tid(candidates[idx].id);
 
+		Distance	  d = candidates[idx].distance;
+		HeapTupleData tuple;
+		bool		  have_tuple = false;
+
+		/*
+		 * The stream's pin keeps the page resident, not unchanged: take the
+		 * content lock for the line pointer and tuple header, then read the
+		 * body unlocked, as heap_fetch does.
+		 */
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		Page		 page = BufferGetPage(buf);
 		OffsetNumber off  = ItemPointerGetOffsetNumber(&tid);
-		ItemId		 lp	  = PageGetItemId(page, off);
 
-		Distance d = candidates[idx].distance;
-		if (ItemIdIsNormal(lp))
+		/* A TID can outlive its line pointer: VACUUM truncates the array. */
+		if (off >= FirstOffsetNumber && off <= PageGetMaxOffsetNumber(page))
 		{
-			HeapTupleData tuple;
-			tuple.t_tableOid = RelationGetRelid(s->rel);
-			tuple.t_data	 = (HeapTupleHeader)PageGetItem(page, lp);
-			tuple.t_len		 = ItemIdGetLength(lp);
-			ItemPointerCopy(&tid, &tuple.t_self);
+			ItemId lp = PageGetItemId(page, off);
+
+			if (ItemIdIsNormal(lp))
+			{
+				tuple.t_tableOid = RelationGetRelid(s->rel);
+				tuple.t_data	 = (HeapTupleHeader)PageGetItem(page, lp);
+				tuple.t_len		 = ItemIdGetLength(lp);
+				ItemPointerCopy(&tid, &tuple.t_self);
+				have_tuple = true;
+			}
+		}
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+		if (have_tuple)
+		{
+			bool  isnull;
+			Datum val;
 
 			ExecStoreBufferHeapTuple(&tuple, slot, buf);
+			val = slot_getattr(slot, vec_attnum, &isnull);
 
-			bool  isnull;
-			Datum val = slot_getattr(slot, vec_attnum, &isnull);
 			if (!isnull)
 			{
 				Vec32Ref qref = {.data = query, .dim = dim};
